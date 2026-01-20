@@ -246,11 +246,9 @@ class LatentRecord:
                 for tok in toks
             ]
             highlighted_text = []
-            highlighted_text.append(
-                """
+            highlighted_text.append("""
         <body style="background-color: black; color: white;">
-        """
-            )
+        """)
             max_value = max([max(activ) for activ in activations])
             min_value = min([min(activ) for activ in activations])
             # Add color bar

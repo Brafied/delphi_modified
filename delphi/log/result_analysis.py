@@ -354,10 +354,8 @@ def log_results(
                 )
             )
         ]
-        print(
-            f"""Average fraction of failed examples: \
-{sum(fractions_failed) / len(fractions_failed)}"""
-        )
+        print(f"""Average fraction of failed examples: \
+{sum(fractions_failed) / len(fractions_failed)}""")
 
         print("\nConfusion Matrix:")
         print(
