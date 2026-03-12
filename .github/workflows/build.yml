@@ -22,6 +22,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev,visualize]"
+      - name: Run lint
+        run: ruff check .
+      - name: Run type check (non-blocking)
+        continue-on-error: true
+        run: pyright
+      - name: Smoke check
+        run: python -c "import delphi; print(delphi.__version__)"
       - name: Run tests
         run: pytest
       - name: build
