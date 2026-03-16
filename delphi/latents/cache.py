@@ -11,6 +11,7 @@ from safetensors.numpy import save_file
 from torch import Tensor
 from tqdm import tqdm
 from transformers import PreTrainedModel
+from torch.utils.data import DataLoader
 
 from delphi import logger
 from delphi.config import CacheConfig
@@ -85,11 +86,13 @@ class InMemoryCache:
         self.latent_activations_batches: dict[str, list[latent_tensor_type]] = (
             defaultdict(list)
         )
-        self.tokens_batches: dict[str, list[token_tensor_type]] = defaultdict(list)
+        self.chosen_tokens_batches: dict[str, list[token_tensor_type]] = defaultdict(list)
+        self.rejected_tokens_batches: dict[str, list[token_tensor_type]] = defaultdict(list)
 
         self.latent_locations: dict[str, location_tensor_type] = {}
         self.latent_activations: dict[str, latent_tensor_type] = {}
-        self.tokens: dict[str, token_tensor_type] = {}
+        self.chosen_tokens: dict[str, token_tensor_type] = {}
+        self.rejected_tokens: dict[str, token_tensor_type] = {}
 
         self.filters = filters
         self.batch_size = batch_size
@@ -97,9 +100,10 @@ class InMemoryCache:
     def add(
         self,
         latents: latent_tensor_type,
-        tokens: token_tensor_type,
+        chosen_tokens: token_tensor_type,
         batch_number: int,
         module_path: str,
+        rejected_tokens,
     ):
         """
         Add the latents from a module to the cache.
@@ -113,13 +117,15 @@ class InMemoryCache:
         latent_locations, latent_activations = self.get_nonzeros(latents, module_path)
         latent_locations = latent_locations.cpu()
         latent_activations = latent_activations.cpu()
-        tokens = tokens.cpu()
+        chosen_tokens = chosen_tokens.cpu()
+        rejected_tokens = rejected_tokens.cpu()
 
         # Adjust batch indices
         latent_locations[:, 0] += batch_number * self.batch_size
         self.latent_locations_batches[module_path].append(latent_locations)
         self.latent_activations_batches[module_path].append(latent_activations)
-        self.tokens_batches[module_path].append(tokens)
+        self.chosen_tokens_batches[module_path].append(chosen_tokens)
+        self.rejected_tokens_batches[module_path].append(rejected_tokens)
 
     def save(self):
         """
@@ -134,8 +140,12 @@ class InMemoryCache:
                 self.latent_activations_batches[module_path], dim=0
             )
 
-            self.tokens[module_path] = torch.cat(
-                self.tokens_batches[module_path], dim=0
+            self.chosen_tokens[module_path] = torch.cat(
+                self.chosen_tokens_batches[module_path], dim=0
+            )
+
+            self.rejected_tokens[module_path] = torch.cat(
+                self.rejected_tokens_batches[module_path], dim=0
             )
 
     def get_nonzeros(self, latents: latent_tensor_type, module_path: str) -> tuple[
@@ -260,29 +270,42 @@ class LatentCache:
             n_tokens: Total number of tokens to process.
             tokens: Input tokens.
         """
-        token_batches = self.load_token_batches(n_tokens, tokens)
+        hook_context= {"mask": None}
+        def processing_function(activations):
+            mask = hook_context["mask"]
+            batch_size = activations.shape[0] // 2
+            chosen_activations, rejected_activations = activations.split(batch_size, dim=0)
+            chosen_mask, rejected_mask = mask.split(batch_size, dim=0)
+            chosen_last_activations = chosen_activations[torch.arange(batch_size, device=activations.device), chosen_mask.sum(dim=1).long() - 1]
+            rejected_last_activations = rejected_activations[torch.arange(batch_size, device=activations.device), rejected_mask.sum(dim=1).long() - 1]
+            activations_difference = chosen_last_activations - rejected_last_activations
+            return activations_difference.unsqueeze(1)
+
+        dataloader = DataLoader(tokens, batch_size=self.batch_size)
 
         total_tokens = 0
-        total_batches = len(token_batches)
-        tokens_per_batch = token_batches[0].numel()
+        total_batches = len(dataloader)
+        tokens_per_batch = self.batch_size
         with tqdm(total=total_batches, desc="Caching latents") as pbar:
-            for batch_number, batch in enumerate(token_batches):
+            for batch_number, batch in enumerate(dataloader):
                 total_tokens += tokens_per_batch
 
+                hook_context["mask"] = torch.cat([batch["chosen_attention_mask"], batch["rejected_attention_mask"]], dim=0).to(self.model.device)
                 with torch.no_grad():
                     with collect_activations(
                         self.model,
                         list(self.hookpoint_to_sparse_encode.keys()),
+                        processing_function,
                         self.transcode,
                     ) as activations:
-                        self.model(batch.to(self.model.device))
+                        self.model(torch.cat([batch["chosen_input_ids"], batch["rejected_input_ids"]], dim=0).to(self.model.device))
 
                         for hookpoint, latents in activations.items():
                             sae_latents = self.hookpoint_to_sparse_encode[hookpoint](
                                 latents
                             )
-                            self.cache.add(sae_latents, batch, batch_number, hookpoint)
-                            firing_counts = (sae_latents.cpu() > 0).sum((0, 1))
+                            self.cache.add(sae_latents, batch["chosen_input_ids"], batch_number, hookpoint, batch["rejected_input_ids"])
+                            firing_counts = (sae_latents.abs() > 0).sum((0, 1))
                             if self.width is None:
                                 self.width = sae_latents.shape[2]
 
@@ -350,7 +373,8 @@ class LatentCache:
         for module_path in self.cache.latent_locations.keys():
             latent_locations = self.cache.latent_locations[module_path]
             latent_activations = self.cache.latent_activations[module_path]
-            tokens = self.cache.tokens[module_path].numpy()
+            chosen_tokens = self.cache.chosen_tokens[module_path].numpy()
+            rejected_tokens = self.cache.rejected_tokens[module_path].numpy()
 
             latent_indices = latent_locations[:, 2]
 
@@ -386,7 +410,8 @@ class LatentCache:
                     "activations": masked_activations,
                 }
                 if save_tokens:
-                    split_data["tokens"] = tokens
+                    split_data["chosen_tokens"] = chosen_tokens
+                    split_data["rejected_tokens"] = rejected_tokens
 
                 save_file(split_data, output_file)
 

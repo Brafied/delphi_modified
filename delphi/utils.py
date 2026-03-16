@@ -4,6 +4,8 @@ import numpy as np
 import torch
 from torch import Tensor
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
+import re
+from multiprocessing import cpu_count
 
 
 def load_tokenized_data(
@@ -37,35 +39,74 @@ def load_tokenized_data(
 
     data = load_dataset(dataset_repo, name=dataset_name, split=dataset_split)
     data = data.shuffle(seed)
-    tokens_ds = chunk_and_tokenize(
-        data,  # type: ignore
-        tokenizer,
-        max_seq_len=ctx_len,
-        text_key=column_name,
+
+    def template_and_tokenize_conversations(preference_pairs):
+        def template_conversation(conversation):
+            messages = []
+            current_role = None
+            for conversation_fragment in re.split(r'(Human:|Assistant:)', conversation):
+                conversation_fragment = conversation_fragment.strip()
+                if not conversation_fragment:
+                    continue
+                if conversation_fragment == "Human:":
+                    current_role = "user"
+                elif conversation_fragment == "Assistant:":
+                    current_role = "assistant"
+                else:
+                    messages.append({"role": current_role, "content": conversation_fragment})
+            return tokenizer.apply_chat_template(messages, tokenize=False)
+        templated_chosen_conversations = [template_conversation(conversation) for conversation in preference_pairs["chosen"]]
+        templated_rejected_conversations = [template_conversation(conversation) for conversation in preference_pairs["rejected"]]
+        tokenized_chosen_conversations = tokenizer(templated_chosen_conversations, add_special_tokens=False)
+        tokenized_rejected_conversation = tokenizer(templated_rejected_conversations, add_special_tokens=False)
+        filtered_chosen_conversation = []
+        filtered_rejected_conversation = []
+        for i in range(len(templated_chosen_conversations)):
+            chosen_input_ids = tokenized_chosen_conversations["input_ids"][i]
+            rejected_input_ids = tokenized_rejected_conversation["input_ids"][i]
+            if len(chosen_input_ids) <= ctx_len and len(rejected_input_ids) <= ctx_len:
+                filtered_chosen_conversation.append({
+                    "input_ids": chosen_input_ids,
+                    "attention_mask": tokenized_chosen_conversations["attention_mask"][i]
+                })
+                filtered_rejected_conversation.append({
+                    "input_ids": rejected_input_ids,
+                    "attention_mask": tokenized_rejected_conversation["attention_mask"][i]
+                })
+        if len(filtered_chosen_conversation) == 0:
+            return {
+                "chosen_input_ids": [],
+                "chosen_attention_mask": [],
+                "rejected_input_ids": [],
+                "rejected_attention_mask": [],
+            }
+        padded_chosen_conversations = tokenizer.pad(
+            filtered_chosen_conversation,
+            padding="max_length",
+            max_length=ctx_len,
+            return_tensors="np"
+        )
+        padded_rejected_conversations = tokenizer.pad(
+            filtered_rejected_conversation,
+            padding="max_length",
+            max_length=ctx_len,
+            return_tensors="np"
+        )
+        return {
+            "chosen_input_ids": padded_chosen_conversations["input_ids"],
+            "chosen_attention_mask": padded_chosen_conversations["attention_mask"],
+            "rejected_input_ids": padded_rejected_conversations["input_ids"],
+            "rejected_attention_mask": padded_rejected_conversations["attention_mask"],
+        }
+    tokens_ds = data.map(
+        template_and_tokenize_conversations,
+        batched=True,
+        batch_size=2048,
+        num_proc=cpu_count() // 2,
+        remove_columns=data.column_names,
     )
-
-    tokens = tokens_ds["input_ids"]
-
-    try:
-        from datasets import Column
-
-        if isinstance(tokens, Column):
-            from datasets.table import table_iter
-
-            tokens = torch.cat(
-                [
-                    torch.from_numpy(
-                        np.stack(table_chunk["input_ids"].to_numpy(), axis=0)
-                    )
-                    for table_chunk in table_iter(
-                        tokens.source._data, convert_to_tensor_chunk_size
-                    )
-                ]
-            )
-    except ImportError:
-        assert len(tokens.shape) == 2
-
-    return tokens
+    tokens_ds.set_format("torch")
+    return tokens_ds
 
 
 T = TypeVar("T")

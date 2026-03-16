@@ -1,5 +1,4 @@
 from contextlib import contextmanager
-from typing import Any
 
 from torch import Tensor, nn
 from transformers import PreTrainedModel
@@ -7,7 +6,7 @@ from transformers import PreTrainedModel
 
 @contextmanager
 def collect_activations(
-    model: PreTrainedModel, hookpoints: list[str], transcode: bool = False
+    model: PreTrainedModel, hookpoints: list[str], processing_fn, transcode: bool = False,
 ):
     """
     Context manager that temporarily hooks models and collects their activations.
@@ -36,9 +35,10 @@ def collect_activations(
                     activations[hookpoint] = input
             else:
                 if isinstance(output, tuple):
-                    activations[hookpoint] = output[0]
+                    hooked_activations = output[0]
                 else:
-                    activations[hookpoint] = output
+                    hooked_activations = output
+            activations[hookpoint] = processing_fn(hooked_activations)
 
         return hook_fn
 
