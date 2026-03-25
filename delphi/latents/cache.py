@@ -86,13 +86,11 @@ class InMemoryCache:
         self.latent_activations_batches: dict[str, list[latent_tensor_type]] = (
             defaultdict(list)
         )
-        self.chosen_tokens_batches: dict[str, list[token_tensor_type]] = defaultdict(list)
-        self.rejected_tokens_batches: dict[str, list[token_tensor_type]] = defaultdict(list)
+        self.tokens_batches: dict[str, list[token_tensor_type]] = defaultdict(list)
 
         self.latent_locations: dict[str, location_tensor_type] = {}
         self.latent_activations: dict[str, latent_tensor_type] = {}
-        self.chosen_tokens: dict[str, token_tensor_type] = {}
-        self.rejected_tokens: dict[str, token_tensor_type] = {}
+        self.tokens: dict[str, token_tensor_type] = {}
 
         self.filters = filters
         self.batch_size = batch_size
@@ -100,10 +98,9 @@ class InMemoryCache:
     def add(
         self,
         latents: latent_tensor_type,
-        chosen_tokens: token_tensor_type,
+        tokens: token_tensor_type,
         batch_number: int,
         module_path: str,
-        rejected_tokens,
     ):
         """
         Add the latents from a module to the cache.
@@ -117,15 +114,13 @@ class InMemoryCache:
         latent_locations, latent_activations = self.get_nonzeros(latents, module_path)
         latent_locations = latent_locations.cpu()
         latent_activations = latent_activations.cpu()
-        chosen_tokens = chosen_tokens.cpu()
-        rejected_tokens = rejected_tokens.cpu()
+        tokens = tokens.cpu()
 
         # Adjust batch indices
         latent_locations[:, 0] += batch_number * self.batch_size
         self.latent_locations_batches[module_path].append(latent_locations)
         self.latent_activations_batches[module_path].append(latent_activations)
-        self.chosen_tokens_batches[module_path].append(chosen_tokens)
-        self.rejected_tokens_batches[module_path].append(rejected_tokens)
+        self.tokens_batches[module_path].append(tokens)
 
     def save(self):
         """
@@ -140,12 +135,8 @@ class InMemoryCache:
                 self.latent_activations_batches[module_path], dim=0
             )
 
-            self.chosen_tokens[module_path] = torch.cat(
-                self.chosen_tokens_batches[module_path], dim=0
-            )
-
-            self.rejected_tokens[module_path] = torch.cat(
-                self.rejected_tokens_batches[module_path], dim=0
+            self.tokens[module_path] = torch.cat(
+                self.tokens_batches[module_path], dim=0
             )
 
     def get_nonzeros(self, latents: latent_tensor_type, module_path: str) -> tuple[
@@ -272,14 +263,8 @@ class LatentCache:
         """
         hook_context= {"mask": None}
         def processing_function(activations):
-            mask = hook_context["mask"]
-            batch_size = activations.shape[0] // 2
-            chosen_activations, rejected_activations = activations.split(batch_size, dim=0)
-            chosen_mask, rejected_mask = mask.split(batch_size, dim=0)
-            chosen_last_activations = chosen_activations[torch.arange(batch_size, device=activations.device), chosen_mask.sum(dim=1).long() - 1]
-            rejected_last_activations = rejected_activations[torch.arange(batch_size, device=activations.device), rejected_mask.sum(dim=1).long() - 1]
-            activations_difference = chosen_last_activations - rejected_last_activations
-            return activations_difference.unsqueeze(1)
+            last_activations = activations[torch.arange(activations.shape[0], device=activations.device), hook_context["mask"].sum(dim=1).long() - 1]
+            return last_activations.unsqueeze(1)
 
         dataloader = DataLoader(tokens, batch_size=self.batch_size)
 
@@ -290,7 +275,7 @@ class LatentCache:
             for batch_number, batch in enumerate(dataloader):
                 total_tokens += tokens_per_batch
 
-                hook_context["mask"] = torch.cat([batch["chosen_attention_mask"], batch["rejected_attention_mask"]], dim=0).to(self.model.device)
+                hook_context["mask"] = batch["attention_mask"].to(self.model.device)
                 with torch.no_grad():
                     with collect_activations(
                         self.model,
@@ -298,14 +283,14 @@ class LatentCache:
                         processing_function,
                         self.transcode,
                     ) as activations:
-                        self.model(torch.cat([batch["chosen_input_ids"], batch["rejected_input_ids"]], dim=0).to(self.model.device))
+                        self.model(batch["input_ids"].to(self.model.device))
 
                         for hookpoint, latents in activations.items():
                             sae_latents = self.hookpoint_to_sparse_encode[hookpoint](
                                 latents
                             )
-                            self.cache.add(sae_latents, batch["chosen_input_ids"], batch_number, hookpoint, batch["rejected_input_ids"])
-                            firing_counts = (sae_latents.abs() > 0).sum((0, 1))
+                            self.cache.add(sae_latents, batch["input_ids"], batch_number, hookpoint)
+                            firing_counts = (sae_latents > 0).sum((0, 1))
                             if self.width is None:
                                 self.width = sae_latents.shape[2]
 
@@ -373,8 +358,7 @@ class LatentCache:
         for module_path in self.cache.latent_locations.keys():
             latent_locations = self.cache.latent_locations[module_path]
             latent_activations = self.cache.latent_activations[module_path]
-            chosen_tokens = self.cache.chosen_tokens[module_path].numpy()
-            rejected_tokens = self.cache.rejected_tokens[module_path].numpy()
+            tokens = self.cache.tokens[module_path].numpy()
 
             latent_indices = latent_locations[:, 2]
 
@@ -410,8 +394,7 @@ class LatentCache:
                     "activations": masked_activations,
                 }
                 if save_tokens:
-                    split_data["chosen_tokens"] = chosen_tokens
-                    split_data["rejected_tokens"] = rejected_tokens
+                    split_data["tokens"] = tokens
 
                 save_file(split_data, output_file)
 

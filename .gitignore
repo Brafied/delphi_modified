@@ -184,3 +184,5 @@ statistics/
 .embedding_cache/
 wandb/
 uv.lock
+
+*.sh

@@ -105,6 +105,8 @@ def load_sparsify_sparse_coders(
                     decoder=False,
                 )
 
+            sparse_model = sparse_model.to(device)
+            
             sparse_model_dict[hookpoint] = sparse_model
             if compile:
                 sparse_model_dict[hookpoint] = torch.compile(
